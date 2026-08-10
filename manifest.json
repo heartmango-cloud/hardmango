@@ -1,0 +1,12 @@
+{
+  "name": "Hardmango Bass Lab",
+  "short_name": "Hardmango",
+  "description": "ห้องซ้อมเบสแจ๊ส — Solo Lab · บทเรียน 73 บท · แบ็คกิงแทร็คที่ไม่เล่นซ้ำ",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "orientation": "any",
+  "background_color": "#06070c",
+  "theme_color": "#06070c",
+  "lang": "th"
+}
