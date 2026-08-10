@@ -10618,11 +10618,45 @@ const A7 = {
   ready: false,
 };
 
+/* =========================================================================
+   [แก้ V7.1] ปรับสายสัญญาณหลัก — สาเหตุที่ "ทุกอย่างฟังแปลกรวม ๆ กัน"
+
+   วินิจฉัย: คอมเพรสเซอร์ตัวเดียวอยู่บนมาสเตอร์ ตั้ง threshold ไว้ที่ -16 dB
+   ซึ่งเหมาะกับระดับเสียงของ V6 (เบสพีคราว 0.37) แต่เบส V7 พีคถึงราว 1.1
+   เพราะบัฟเฟอร์สายถูกนอร์มัลไลซ์เป็น 1.0 แล้วยังผ่านฟิลเตอร์ตัวไม้ที่บวกอีก
+   +4.5 dB กับ +2.6 dB ก่อนคูณซองเสียง 0.65
+
+   ผลคือทุกครั้งที่เบสดัง คอมเพรสเซอร์จะกดทั้งมิกซ์ลง — กลองกับเปียโนหุบตาม
+   เสียงจึงเหมือน "หายใจ" ผิดจังหวะทั้งวง ไม่ใช่แค่เครื่องใดเครื่องหนึ่งเพี้ยน
+   อาการนี้เรียกว่า pumping และเป็นเหตุผลที่ผู้ใช้รู้สึกว่าแปลกไปทั้งหมด
+
+   แก้สามจุด: ลดระดับต้นทางให้เท่า V6 · คลายคอมเพรสเซอร์ให้เป็นตัวกันล้น
+   ไม่ใช่ตัวบีบ · ลดปริมาณห้องเริ่มต้น
+   ========================================================================= */
+function a7fixMaster(){
+  if(!AU.comp) return;
+  try{
+    AU.comp.threshold.value = -6;    /* เดิม -16 — ต่ำเกินจนบีบตลอดเวลา */
+    AU.comp.ratio.value = 2.4;       /* เดิม 3.2 */
+    AU.comp.knee.value = 18;
+    if(AU.comp.attack) AU.comp.attack.value = 0.012;   /* เดิม 0.003 กัดทรานเซียนต์ทุกตัว */
+    if(AU.comp.release) AU.comp.release.value = 0.28;
+  }catch(e){}
+}
+const _ensureAudioV6 = ensureAudio;
+ensureAudio = function(){
+  const c = _ensureAudioV6();
+  if(c) a7fixMaster();
+  return c;
+};
+
 /* ---------- ตัวช่วย ---------- */
 function a7num(v, d){ return (typeof v === 'number' && isFinite(v)) ? v : d; }
 function a7engine(){ return (state && state.audioEngine === 'v6') ? 'v6' : 'v7'; }
-/* ปริมาณห้อง 0–100 (0 = แห้งสนิท) */
-function a7room(){ return clamp(a7num(state && state.audioRoom, 26), 0, 100); }
+/* ปริมาณห้อง 0–100 (0 = แห้งสนิท)
+   [แก้ V7.1] ค่าเริ่มต้นลดจาก 26 → 12 — ห้องมากไปทำให้ทุกอย่างเบลอรวมกัน
+   ซึ่งเป็นอีกครึ่งหนึ่งของอาการ "ฟังแปลกทั้งวง" */
+function a7room(){ return clamp(a7num(state && state.audioRoom, 12), 0, 100); }
 
 /* =========================================================================
    ห้อง — สร้าง impulse response เอง ไม่ต้องโหลดไฟล์
@@ -10670,7 +10704,9 @@ function a7ensure(){
       const n = 1024, curve = new Float32Array(n);
       for(let i = 0; i < n; i++){
         const x = (i / (n - 1)) * 2 - 1;
-        curve[i] = Math.tanh(x * 1.7) / Math.tanh(1.7);
+        /* [แก้ V7.1] ลดแรงขับจาก 1.7 → 1.15 — เดิมบิดเบือนจนได้ยินว่าแตก
+           เมื่อรวมกับระดับต้นทางที่สูงเกิน */
+        curve[i] = Math.tanh(x * 1.15) / Math.tanh(1.15);
       }
       A7.drive.curve = curve;
       if('oversample' in A7.drive) A7.drive.oversample = '2x';
@@ -10790,13 +10826,15 @@ function playBassV7(midi, when, dur, vel){
     const src = c.createBufferSource();
     src.buffer = buf;
 
-    /* ตัวไม้ของเบส — เรโซแนนซ์ที่ทำให้รู้ว่าเป็นเครื่องดนตรี ไม่ใช่สายลอย ๆ */
+    /* ตัวไม้ของเบส — เรโซแนนซ์ที่ทำให้รู้ว่าเป็นเครื่องดนตรี ไม่ใช่สายลอย ๆ
+       [แก้ V7.1] ลดการบวกลงครึ่งหนึ่ง เดิม +4.5/+2.6 dB ทำให้สัญญาณเกิน 0 dBFS
+       ก่อนถึงบัสด้วยซ้ำ และการสกูปกลาง -3 dB ทำให้เสียงกลวงจนฟังเหมือนโคลน */
     const body1 = c.createBiquadFilter();
-    body1.type = 'peaking'; body1.frequency.value = 92;  body1.Q.value = 1.1; body1.gain.value = 4.5;
+    body1.type = 'peaking'; body1.frequency.value = 92;  body1.Q.value = 0.9; body1.gain.value = 2.2;
     const body2 = c.createBiquadFilter();
-    body2.type = 'peaking'; body2.frequency.value = 210; body2.Q.value = 1.4; body2.gain.value = 2.6;
+    body2.type = 'peaking'; body2.frequency.value = 210; body2.Q.value = 1.1; body2.gain.value = 1.4;
     const body3 = c.createBiquadFilter();
-    body3.type = 'peaking'; body3.frequency.value = 720; body3.Q.value = 2.0; body3.gain.value = -3.0;
+    body3.type = 'peaking'; body3.frequency.value = 720; body3.Q.value = 1.6; body3.gain.value = -1.2;
 
     /* ปิ๊กอัพ+แอมป์ — ตัดความถี่สูงที่สายไม่มีจริงออก */
     const lp = c.createBiquadFilter();
@@ -10807,9 +10845,12 @@ function playBassV7(midi, when, dur, vel){
     const hp = c.createBiquadFilter();
     hp.type = 'highpass'; hp.frequency.value = 42;
 
-    /* ซองเสียง — สายไม่หยุดทันทีที่ปล่อยนิ้ว มันถูก "ปิด" */
+    /* ซองเสียง — สายไม่หยุดทันทีที่ปล่อยนิ้ว มันถูก "ปิด"
+       [แก้ V7.1] พีคลดจาก 0.72 → 0.30 ให้เท่ากับระดับของ V6 (~0.37 ที่ vel เต็ม)
+       กติกาที่ควรยึด: เอนจิ้นใหม่ต้องไม่ดังกว่าเอนจิ้นเก่าที่มิกซ์ตำแหน่งเดียวกัน
+       ไม่งั้นทุกอย่างที่อยู่หลังจากนั้นในสายสัญญาณจะเปลี่ยนพฤติกรรมหมด */
     const g = c.createGain();
-    const peak = 0.72 * vel;
+    const peak = 0.30 * vel;
     const rel = clamp(dur * 0.34, 0.06, 0.30);
     g.gain.setValueAtTime(0.0001, when);
     g.gain.linearRampToValueAtTime(peak, when + 0.004);
@@ -13434,7 +13475,392 @@ function loadArticleExample(articleId, idx){
 }
 
 
-/* ══════ v7: UI + wiring ทั้งหมด (ทับ renderAll/wire): _p36_ui7.js ══════ */
+/* ══════ v7.1: เครื่องดนตรีจากแซมเปิลจริง (ทับ playBass/playKey/playDrum อีกชั้น): _p38_sampler7.js ══════ */
+/* =========================================================================
+   V7.1 — เครื่องดนตรีจากแซมเปิลจริง (Sampler)
+
+   สิ่งที่ผมเข้าใจผิดตอน V7:
+   บอกว่า "โหลดแซมเปิลไม่ได้" — จริงเฉพาะเครื่องที่ผมทำงานอยู่ (พร็อกซีบล็อก)
+   แต่ <b>เบราว์เซอร์ของผู้ใช้โหลดได้ปกติ</b> แอปจึงดึงไฟล์เสียงตอนรันได้เลย
+   ข้อจำกัดที่เหลืออยู่ข้อเดียวคือผมฟังผลลัพธ์เองไม่ได้ ต้องให้ผู้ใช้ตัดสิน
+
+   แหล่งเสียง: Benjamin Gleitzman's pre-rendered soundfonts (FluidR3_GM /
+   MusyngKite) ซึ่งเป็นชุดเดียวกับที่เว็บแอปดนตรีจำนวนมากใช้
+   เป็นเครื่องดนตรีอัดจริงตระกูล General MIDI — ตรงกับลักษณะเสียงของ iReal Pro
+   ที่ใช้อัพไรท์เบส เปียโน โรดส์ ไวบ์ กีตาร์ ออร์แกน และกลองที่อัดมาจริง
+
+   ไม่พึ่งไลบรารีภายนอก — soundfont-player ถูก archive ไปแล้ว
+   ผมจึงเขียนตัวโหลดเองให้เล็กและควบคุมได้ และดึง base64 ด้วย regex
+   เพื่อให้ไม่พังถ้าเขาเปลี่ยนรูปแบบตัวห่อหุ้มในอนาคต
+   ========================================================================= */
+
+const SF_HOSTS = {
+  FluidR3_GM: {name:'FluidR3 GM', size:'เล็กกว่า โหลดเร็ว', desc:'ชุดมาตรฐาน เสียงกลาง ๆ ที่ใช้กันแพร่หลายที่สุด'},
+  MusyngKite: {name:'MusyngKite', size:'ใหญ่กว่า โหลดช้ากว่า', desc:'รายละเอียดมากกว่า เสียงเต็มกว่า — แนะนำถ้าเน็ตไม่ช้า'},
+};
+const SF = {
+  /* สองแหล่ง — ลองตัวแรกก่อน ถ้าไม่ได้ค่อยไปตัวสอง
+     jsDelivr ตั้ง CORS header ให้เสมอ ส่วน GitHub Pages ไม่ได้ตั้ง
+     จึงเอา jsDelivr ไว้เป็นตัวสำรองของวิธี fetch */
+  hosts: [
+    'https://gleitz.github.io/midi-js-soundfonts/',
+    'https://cdn.jsdelivr.net/gh/gleitz/midi-js-soundfonts@gh-pages/',
+  ],
+  base: 'https://gleitz.github.io/midi-js-soundfonts/',
+  inst: {},              /* name -> {status:'idle|loading|ready|error', map:{midi:AudioBuffer}, keys:[], err} */
+  onChange: null,
+  disabled: false,       /* ปิดได้ตอนทดสอบ ไม่ให้ยิงเน็ตจริง */
+};
+
+/* เครื่องดนตรีที่ให้เลือกต่อบัส — คัดเฉพาะตัวที่ใช้ในแจ๊สจริง
+   lo/hi = ช่วงโน้ตที่ถอดรหัสจริง ยิ่งแคบยิ่งโหลดเร็ว (ถอด mp3 กินซีพียู) */
+const SAMPLE_KITS = {
+  bass: [
+    {id:'acoustic_bass',        name:'อัพไรท์เบส (ดับเบิลเบส)', lo:28, hi:64, tip:'เสียงมาตรฐานของแจ๊สสวิง'},
+    {id:'electric_bass_finger', name:'เบสไฟฟ้า · นิ้ว',        lo:28, hi:67, tip:'ฟิวชัน ฟังก์ ป็อป'},
+    {id:'electric_bass_pick',   name:'เบสไฟฟ้า · ปิ๊ก',        lo:28, hi:67, tip:'คมกว่า เหมาะกับร็อก'},
+    {id:'fretless_bass',        name:'เฟรตเลส',                lo:28, hi:67, tip:'เสียงสาย Jaco'},
+    {id:'contrabass',           name:'คอนทราเบส (สี)',         lo:28, hi:60, tip:'สีคันชัก ไม่ใช่ดีด'},
+  ],
+  keys: [
+    {id:'acoustic_grand_piano', name:'เปียโนอะคูสติก',   lo:36, hi:96, tip:'ตัวเลือกหลักของแจ๊ส'},
+    {id:'electric_piano_1',     name:'โรดส์ 1',          lo:36, hi:96, tip:'นุ่ม อบอุ่น'},
+    {id:'electric_piano_2',     name:'โรดส์ 2',          lo:36, hi:96, tip:'คมกว่า มีระฆังมากกว่า'},
+    {id:'vibraphone',           name:'ไวบราโฟน',         lo:41, hi:89, tip:'เสียงลอย เหมาะกับบัลลาด'},
+    {id:'electric_guitar_jazz', name:'กีตาร์แจ๊ส',       lo:40, hi:88, tip:'คอมป์แบบกีตาร์'},
+    {id:'drawbar_organ',        name:'ออร์แกน',          lo:36, hi:96, tip:'เสียงค้าง เหมาะกับบลูส์'},
+    {id:'acoustic_guitar_nylon',name:'กีตาร์ไนลอน',      lo:40, hi:88, tip:'บอสซาโนวา'},
+  ],
+  drums: [
+    {id:'percussion',           name:'ชุดกลองอัดจริง',   lo:35, hi:81, tip:'ชุดกลอง GM — ใช้แทนกลองสังเคราะห์'},
+  ],
+};
+/* GM percussion: เสียงกลองแต่ละตัวคือ "โน้ต" หนึ่งตัวในแผนที่มาตรฐาน */
+const GM_DRUM = {
+  kick:36, snare:38, rim:37, hat:42, hatopen:46, ride:51, bell:53,
+  tom:45, clave:75, brush:38,
+};
+
+function sfInst(name){
+  if(!SF.inst[name]) SF.inst[name] = {status:'idle', map:{}, keys:[], err:null, name};
+  return SF.inst[name];
+}
+function sfUrl(name, font, fmt, host){
+  return (host || SF.base) + (font || sfFont()) + '/' + name + '-' + (fmt || 'mp3') + '.js';
+}
+function sfFont(){ return SF_HOSTS[state.sfFont] ? state.sfFont : 'FluidR3_GM'; }
+function sfEnabled(){ return state.audioEngine === 'sample'; }
+/* โหลดได้เมื่ออยู่ในเบราว์เซอร์จริงเท่านั้น
+   ★ เช็ค document.createElement ด้วย เพราะชุดทดสอบ headless มี fetch (Node 22)
+     ถ้าไม่กันไว้ เทสต์จะยิงเน็ตจริงทุกครั้งที่รัน — ช้าและไม่แน่นอน */
+function sfOnline(){
+  if(SF.disabled) return false;
+  if(typeof document === 'undefined' || typeof document.createElement !== 'function') return false;
+  if(typeof navigator !== 'undefined' && navigator.onLine === false) return false;
+  return true;
+}
+/* ชื่อโน้ตของ soundfont → หมายเลข MIDI  (C4 = 60) */
+const SF_PC = {C:0, D:2, E:4, F:5, G:7, A:9, B:11};
+function sfNoteToMidi(s){
+  const m = /^([A-Ga-g])([#b]?)(-?\d+)$/.exec(String(s).trim());
+  if(!m) return null;
+  const base = SF_PC[m[1].toUpperCase()];
+  if(base == null) return null;
+  const acc = m[2] === '#' ? 1 : m[2] === 'b' ? -1 : 0;
+  return (parseInt(m[3], 10) + 1) * 12 + base + acc;
+}
+function b64ToBytes(b64){
+  if(typeof atob === 'function'){
+    const bin = atob(b64), out = new Uint8Array(bin.length);
+    for(let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+    return out.buffer;
+  }
+  if(typeof Buffer !== 'undefined') return Uint8Array.from(Buffer.from(b64, 'base64')).buffer;
+  return null;
+}
+
+/* =========================================================================
+   ตัวโหลด
+
+   ★ วิธีหลักคือแทรก <script src="..."> ไม่ใช่ fetch
+     เหตุผล: สคริปต์แท็กไม่อยู่ใต้กฎ CORS ส่วน fetch อยู่ใต้กฎนั้น
+     GitHub Pages ไม่ได้ตั้ง Access-Control-Allow-Origin ให้ ถ้าใช้ fetch
+     จะโดนบล็อกทันที และถ้าเปิดไฟล์แบบดับเบิลคลิก (file://) จะยิ่งโดนหนักกว่า
+     ไฟล์เหล่านี้ประกาศ `var MIDI` ที่ระดับ global เมื่อโหลดด้วยสคริปต์แท็ก
+     เราจึงอ่านค่าจาก window.MIDI.Soundfont ได้ตรง ๆ
+
+   ถ้าสคริปต์แท็กพลาด ค่อยลอง fetch จาก jsDelivr ซึ่งตั้ง CORS ให้เสมอ
+   แล้วแกะ base64 ด้วย regex (ไม่ eval เพราะปลอดภัยกว่าและไม่ผูกกับตัวห่อหุ้ม)
+   ========================================================================= */
+const SF_PAIR = /"([A-Ga-g][#b]?-?\d+)"\s*:\s*"data:audio\/[^;]+;base64,([A-Za-z0-9+/=]+)"/g;
+
+function sfLoadScript(url, timeoutMs){
+  return new Promise((resolve, reject) => {
+    let done = false;
+    const el = document.createElement('script');
+    el.async = true; el.src = url;
+    const finish = (err) => {
+      if(done) return; done = true;
+      try{ el.parentNode && el.parentNode.removeChild(el); }catch(e){}
+      err ? reject(err) : resolve();
+    };
+    el.onload = () => finish(null);
+    el.onerror = () => finish(new Error('โหลดสคริปต์ไม่ได้'));
+    setTimeout(() => finish(new Error('หมดเวลารอ')), timeoutMs || 45000);
+    (document.head || document.documentElement).appendChild(el);
+  });
+}
+/* อ่านตารางโน้ตที่สคริปต์เพิ่งประกาศไว้ */
+function sfFromGlobal(name){
+  try{
+    const root = (typeof window !== 'undefined' && window.MIDI) ||
+                 (typeof MIDI !== 'undefined' ? MIDI : null);
+    const t = root && root.Soundfont && root.Soundfont[name];
+    return (t && typeof t === 'object') ? t : null;
+  }catch(e){ return null; }
+}
+
+async function sfLoadInstrument(name, opts){
+  const o = opts || {};
+  const inst = sfInst(name);
+  if(inst.status === 'ready' || inst.status === 'loading') return inst;
+  if(!sfOnline()){ inst.status = 'error'; inst.err = 'ยังโหลดไม่ได้ในตอนนี้'; return inst; }
+  const ctx = ensureAudio();
+  if(!ctx){ inst.status = 'error'; inst.err = 'เปิดระบบเสียงไม่ได้'; return inst; }
+
+  inst.status = 'loading'; inst.err = null; inst.progress = 0;
+  if(SF.onChange) SF.onChange(inst);
+  try{
+    const lo = o.lo != null ? o.lo : 0, hi = o.hi != null ? o.hi : 127;
+    const jobs = [];
+    let lastErr = null, table = null;
+
+    /* --- วิธีที่ 1: สคริปต์แท็ก (ไม่ติด CORS) --- */
+    for(const host of SF.hosts){
+      try{
+        await sfLoadScript(sfUrl(name, o.font, o.fmt || 'mp3', host));
+        table = sfFromGlobal(name);
+        if(table) break;
+      }catch(e){ lastErr = e; }
+    }
+    if(table){
+      Object.keys(table).forEach(k => {
+        const midi = sfNoteToMidi(k);
+        if(midi == null || midi < lo || midi > hi) return;
+        const v = String(table[k] || '');
+        const i = v.indexOf('base64,');
+        if(i < 0) return;
+        jobs.push({midi, b64: v.slice(i + 7)});
+      });
+    }
+    /* --- วิธีที่ 2: fetch + regex (สำรอง) --- */
+    if(!jobs.length && typeof fetch === 'function'){
+      for(const host of SF.hosts){
+        try{
+          const res = await fetch(sfUrl(name, o.font, o.fmt || 'mp3', host), {mode:'cors'});
+          if(!res.ok) throw new Error('HTTP ' + res.status);
+          const text = await res.text();
+          let m; SF_PAIR.lastIndex = 0;
+          while((m = SF_PAIR.exec(text))){
+            const midi = sfNoteToMidi(m[1]);
+            if(midi == null || midi < lo || midi > hi) continue;
+            jobs.push({midi, b64: m[2]});
+          }
+          if(jobs.length) break;
+        }catch(e){ lastErr = e; }
+      }
+    }
+    if(!jobs.length) throw new Error((lastErr && lastErr.message) || 'ไม่พบข้อมูลเสียง');
+
+    let done = 0;
+    await Promise.all(jobs.map(j => new Promise(resolve => {
+      const bytes = b64ToBytes(j.b64);
+      if(!bytes){ resolve(); return; }
+      const ok = buf => { inst.map[j.midi] = buf; done++; inst.progress = done / jobs.length; resolve(); };
+      const fail = () => { done++; resolve(); };
+      try{
+        const p = ctx.decodeAudioData(bytes, ok, fail);
+        if(p && p.then) p.then(ok, fail);
+      }catch(e){ fail(); }
+    })));
+
+    inst.keys = Object.keys(inst.map).map(Number).sort((a, b) => a - b);
+    if(!inst.keys.length) throw new Error('ถอดรหัสเสียงไม่สำเร็จ');
+    inst.status = 'ready'; inst.progress = 1;
+  }catch(e){
+    inst.status = 'error';
+    inst.err = (e && e.message) || String(e);
+  }
+  if(SF.onChange) SF.onChange(inst);
+  return inst;
+}
+
+/* หาแซมเปิลที่ใกล้ที่สุดแล้วปรับความเร็วเล่นให้ตรงระดับเสียง
+   (soundfont ชุดนี้มีเกือบทุกครึ่งเสียงอยู่แล้ว playbackRate จึงมักเป็น 1) */
+function sfPick(inst, midi){
+  if(!inst || !inst.keys.length) return null;
+  let best = inst.keys[0], bd = 1e9;
+  for(const k of inst.keys){ const d = Math.abs(k - midi); if(d < bd){ bd = d; best = k; } }
+  return {buf: inst.map[best], rate: Math.pow(2, (midi - best) / 12)};
+}
+function sfPlay(name, midi, when, dur, vel, bus, send){
+  const ctx = AU.ctx; if(!ctx) return false;
+  const inst = SF.inst[name];
+  if(!inst || inst.status !== 'ready') return false;
+  const s = sfPick(inst, Math.round(midi));
+  if(!s || !s.buf) return false;
+  try{
+    const src = ctx.createBufferSource();
+    src.buffer = s.buf;
+    src.playbackRate.value = s.rate;
+    const g = ctx.createGain();
+    const peak = clamp(a7num(vel, .8), 0, 1);
+    g.gain.setValueAtTime(0.0001, when);
+    g.gain.linearRampToValueAtTime(peak, when + 0.004);
+    /* ปล่อยให้แซมเปิลดังตามธรรมชาติ แล้วค่อยปิดตอนโน้ตจบ
+       ไม่บีบซองเสียงมาก เพราะแซมเปิลมีซองของตัวเองอยู่แล้ว */
+    const rel = clamp(dur * 0.25, 0.05, 0.35);
+    g.gain.setTargetAtTime(0.0001, when + Math.max(0.06, dur), rel * 0.4);
+    src.connect(g); g.connect(bus);
+    if(send) a7send(g, send);
+    src.start(when);
+    src.stop(when + Math.max(0.12, dur) + rel + 0.3);
+    return true;
+  }catch(e){ return false; }
+}
+
+/* ---------- เครื่องที่เลือกอยู่ ---------- */
+function sfCurrent(kind){
+  const list = SAMPLE_KITS[kind] || [];
+  const want = (state.sfPick && state.sfPick[kind]) || (list[0] && list[0].id);
+  return list.find(x => x.id === want) || list[0] || null;
+}
+function sfSetInstrument(kind, id){
+  if(!SAMPLE_KITS[kind] || !SAMPLE_KITS[kind].some(x => x.id === id)) return;
+  state.sfPick = Object.assign({}, state.sfPick, {[kind]: id});
+  saveAll();
+  const e = SAMPLE_KITS[kind].find(x => x.id === id);
+  sfLoadInstrument(id, {lo: e.lo, hi: e.hi}).then(() => { try{ renderMixer(); }catch(x){} });
+  try{ renderMixer(); }catch(x){}
+}
+/* โหลดทั้งสามบัสพร้อมกัน */
+function sfLoadAll(){
+  const jobs = ['bass','keys','drums'].map(k => {
+    const e = sfCurrent(k);
+    return e ? sfLoadInstrument(e.id, {lo:e.lo, hi:e.hi}) : Promise.resolve(null);
+  });
+  return Promise.all(jobs).then(r => { try{ renderMixer(); }catch(x){} return r; });
+}
+function sfReady(kind){
+  const e = sfCurrent(kind);
+  const i = e && SF.inst[e.id];
+  return !!(i && i.status === 'ready');
+}
+function sfStatus(kind){
+  const e = sfCurrent(kind);
+  if(!e) return {status:'idle'};
+  const i = SF.inst[e.id];
+  return i ? {status:i.status, progress:i.progress || 0, err:i.err, entry:e} : {status:'idle', entry:e};
+}
+
+/* =========================================================================
+   เสียบเข้าสายเดิม — ถ้าแซมเปิลพร้อมใช้แซมเปิล ถ้าไม่พร้อมตกกลับไปสังเคราะห์
+   ผู้ใช้จึงไม่มีทางเจอ "ไม่มีเสียงเลย" แม้เน็ตหลุดกลางคัน
+   ========================================================================= */
+const _bassBeforeSF = playBass, _keyBeforeSF = playKey, _drumBeforeSF = playDrum;
+
+playBass = function(midi, when, dur, vel){
+  if(sfEnabled()){
+    const e = sfCurrent('bass');
+    if(e && sfPlay(e.id, clamp(midi, 24, 67), when, dur, a7num(vel, .9) * 0.85, AU.bus.bass, 0.03)) return;
+  }
+  return _bassBeforeSF(midi, when, dur, vel);
+};
+playKey = function(midi, when, dur, vel){
+  if(sfEnabled()){
+    const e = sfCurrent('keys');
+    if(e && sfPlay(e.id, clamp(midi, 36, 96), when, dur, a7num(vel, .5) * 0.8, AU.bus.keys, 0.12)) return;
+  }
+  return _keyBeforeSF(midi, when, dur, vel);
+};
+playDrum = function(kind, when, vel){
+  if(sfEnabled() && state.sfDrums !== false){
+    const e = sfCurrent('drums');
+    const note = GM_DRUM[kind];
+    /* GM ไม่มีเสียงแปรงกวาด — ใช้ตัวสังเคราะห์ของเราซึ่งทำมาเฉพาะ ดีกว่าใช้สแนร์เบา ๆ */
+    if(e && note != null && kind !== 'brush'){
+      const v = a7num(vel, .7) * (kind === 'ride' || kind === 'hat' ? 0.55 : 0.8);
+      if(sfPlay(e.id, note, when, kind === 'ride' || kind === 'bell' ? 1.2 : 0.4, v, AU.bus.drums,
+                kind === 'ride' || kind === 'bell' ? 0.25 : 0.08)) return;
+    }
+  }
+  return _drumBeforeSF(kind, when, vel);
+};
+
+/* ---------- สลับเอนจิ้น ---------- */
+Object.assign(AUDIO_ENGINES, {
+  sample: {name:'แซมเปิลอัดจริง', desc:'ดึงเครื่องดนตรีที่อัดจริงจากอินเทอร์เน็ตครั้งแรกครั้งเดียว แล้วใช้ออฟไลน์ได้'},
+});
+const _setAudioEngineV7 = setAudioEngine;
+setAudioEngine = function(which){
+  if(which === 'sample'){
+    state.audioEngine = 'sample';
+    A7.cache.clear();
+    saveAll();
+    try{ renderMixer(); }catch(e){}
+    if(!sfOnline()){
+      toast('ต้องต่ออินเทอร์เน็ตครั้งแรกเพื่อโหลดเสียง — ตอนนี้ใช้เสียงสังเคราะห์ไปก่อน');
+      return;
+    }
+    toast('กำลังโหลดเครื่องดนตรี…');
+    sfLoadAll().then(() => {
+      const ok = ['bass','keys','drums'].filter(sfReady);
+      toast(ok.length ? `พร้อมแล้ว: ${ok.length}/3 บัส` : 'โหลดไม่สำเร็จ — ใช้เสียงสังเคราะห์ต่อ');
+    });
+    return;
+  }
+  return _setAudioEngineV7(which);
+};
+
+/* ฟังตัวอย่างของเอนจิ้นแซมเปิล */
+const _auditionV7 = auditionAudio;
+auditionAudio = function(which){
+  if(which !== 'sample') return _auditionV7(which);
+  const c = ensureAudio(); if(!c) return;
+  const keep = state.audioEngine;
+  state.audioEngine = 'sample';
+  const t = c.currentTime + 0.06;
+  [40, 43, 47, 50].forEach((m, i) => playBass(m, t + i * 0.26, 0.24, 0.9));
+  [64, 68, 71, 74].forEach(m => playKey(m, t + 0.52, 0.9, 0.5));
+  ['ride','ride','bell','ride'].forEach((k, i) => playDrum(k, t + i * 0.26, 0.7));
+  playDrum('kick', t, 0.8);
+  playDrum('snare', t + 0.52, 0.6);
+  state.audioEngine = keep;
+};
+
+/* ---------- ค่าเริ่มต้น + บันทึก ---------- */
+(function sfDefaults(){
+  try{
+    ['sfFont','sfPick','sfDrums'].forEach(f => {
+      if(PREF_FIELDS.indexOf(f) < 0) PREF_FIELDS.push(f);
+    });
+  }catch(e){}
+  if(!SF_HOSTS[state.sfFont]) state.sfFont = 'FluidR3_GM';
+  if(!state.sfPick || typeof state.sfPick !== 'object'){
+    state.sfPick = {bass:'acoustic_bass', keys:'acoustic_grand_piano', drums:'percussion'};
+  }
+  if(typeof state.sfDrums !== 'boolean') state.sfDrums = true;
+})();
+
+/* ถ้าผู้ใช้เคยเลือกแซมเปิลไว้ ให้โหลดเงียบ ๆ ตอนแตะระบบเสียงครั้งแรก */
+function sfAutoWarm(){
+  if(!sfEnabled() || !sfOnline()) return;
+  if(['bass','keys','drums'].every(sfReady)) return;
+  sfLoadAll();
+}
+
+
+/* ══════ v7: UI + wiring ทั้งหมด (ทับ renderAll/wire/renderMixer): _p36_ui7.js ══════ */
 /* =========================================================================
    V7 — UI และการต่อสายทั้งหมด
    เพิ่มห้าหน้าใหม่: สไตล์ · คอนเซ็ปต์ · สไปซี่ · คลังเพลง · บทความ
@@ -13902,31 +14328,84 @@ function renderArticles(){
 /* =========================================================================
    ต่อของใหม่เข้าหน้าเดิม
    ========================================================================= */
-/* มิกเซอร์ — เพิ่มตัวเลือกเอนจิ้นเสียงและปริมาณห้อง */
+/* มิกเซอร์ — เลือกเครื่องดนตรีแบบ iReal Pro + เอนจิ้นเสียง + ปริมาณห้อง */
 const _renderMixerV6 = renderMixer;
 function renderMixerV7(){
   _renderMixerV6();
   const host = $('#mixGrid'); if(!host) return;
-  const eng = a7engine();
+  const eng = state.audioEngine === 'sample' ? 'sample' : a7engine();
   const extra = document.createElement('div');
   extra.className = 'lbox wide';
   extra.style.gridColumn = '1 / -1';
+
+  const statusChip = kind => {
+    const s = sfStatus(kind);
+    if(s.status === 'ready')   return '<b style="color:#8be7be">พร้อม</b>';
+    if(s.status === 'loading') return `<b style="color:#ffd98b">กำลังโหลด ${Math.round((s.progress || 0) * 100)}%</b>`;
+    if(s.status === 'error')   return `<b style="color:#ff9fb0">โหลดไม่ได้ — ${esc(s.err || '')}</b>`;
+    return '<span style="opacity:.55">ยังไม่โหลด</span>';
+  };
+  const kitRow = (kind, label) => {
+    const cur = sfCurrent(kind);
+    return `<div class="lbox" style="margin-top:6px"><span>${esc(label)} — ${statusChip(kind)}</span>
+      <select data-sfpick="${kind}" style="width:100%;margin-top:4px">
+        ${(SAMPLE_KITS[kind] || []).map(e =>
+          `<option value="${e.id}"${cur && cur.id === e.id ? ' selected' : ''}>${esc(e.name)} — ${esc(e.tip)}</option>`).join('')}
+      </select></div>`;
+  };
+
   extra.innerHTML = `<span>เครื่องดนตรี</span>
     <div class="row" style="gap:6px;flex-wrap:wrap;margin-top:4px">
       ${Object.entries(AUDIO_ENGINES).map(([k, v]) =>
         `<button class="btn tiny${eng === k ? ' on primary' : ''}" data-aeng="${k}">${esc(v.name)}</button>`).join('')}
+    </div>
+    <p class="legend" style="margin-top:5px">${esc((AUDIO_ENGINES[eng] || {}).desc || '')}</p>
+    <div class="row" style="gap:5px;flex-wrap:wrap;margin-top:6px">
+      <button class="btn tiny" data-aaud="sample">▶ ฟังแซมเปิล</button>
       <button class="btn tiny" data-aaud="v7">▶ ฟัง V7</button>
       <button class="btn tiny" data-aaud="v6">▶ ฟัง V6</button>
     </div>
-    <p class="legend" style="margin-top:5px">${esc(AUDIO_ENGINES[eng].desc)}</p>
-    <label style="display:block;margin-top:8px;font-size:10px;opacity:.7">ห้อง (reverb) <b>${a7room()}</b></label>
+
+    ${eng === 'sample' ? `
+    <div style="margin-top:10px;border-top:1px solid rgba(255,255,255,.08);padding-top:8px">
+      <label style="font-size:10px;opacity:.7">ชุดเสียง</label>
+      <select data-sffont style="width:100%;margin-top:3px">
+        ${Object.entries(SF_HOSTS).map(([k, v]) =>
+          `<option value="${k}"${sfFont() === k ? ' selected' : ''}>${esc(v.name)} — ${esc(v.size)}</option>`).join('')}
+      </select>
+      <p class="legend" style="margin-top:3px">${esc(SF_HOSTS[sfFont()].desc)}</p>
+      ${kitRow('bass', 'เบส')}
+      ${kitRow('keys', 'เปียโน / คอร์ด')}
+      ${kitRow('drums', 'กลอง')}
+      <label class="chip" style="cursor:pointer;padding:6px 9px;margin-top:6px;display:inline-block">
+        <input type="checkbox" data-sfdrums${state.sfDrums !== false ? ' checked' : ''} style="margin-right:6px">
+        ใช้กลองอัดจริง (ปิดแล้วจะกลับไปใช้กลองสังเคราะห์)</label>
+      <div class="row" style="gap:5px;margin-top:6px">
+        <button class="btn tiny primary" data-sfload>โหลด / โหลดใหม่</button></div>
+      <p class="legend" style="margin-top:5px">
+        โหลดจากอินเทอร์เน็ตครั้งแรกครั้งเดียว หลังจากนั้นเบราว์เซอร์เก็บไว้ใช้ออฟไลน์ได้ ·
+        แปรงกวาดยังใช้ตัวสังเคราะห์ เพราะชุด GM ไม่มีเสียงแปรง ·
+        ถ้าโหลดไม่สำเร็จหรือเน็ตหลุด ระบบจะกลับไปใช้เสียงสังเคราะห์เองโดยไม่เงียบ</p>
+    </div>` : ''}
+
+    <label style="display:block;margin-top:10px;font-size:10px;opacity:.7">ห้อง (reverb) <b>${a7room()}</b></label>
     <input type="range" class="range" min="0" max="100" value="${a7room()}" data-aroom>
-    <p class="legend">เสียงที่แห้งสนิทฟังเป็นของสังเคราะห์เสมอ ห้องเล็กน้อยช่วยได้มาก — แต่มากไปจะเบลอ</p>`;
+    <p class="legend">เสียงที่แห้งสนิทฟังเป็นของสังเคราะห์เสมอ ห้องเล็กน้อยช่วยได้ — แต่มากไปจะเบลอรวมกันทั้งวง</p>`;
   host.appendChild(extra);
+
   $$('#mixGrid [data-aeng]').forEach(b => b.onclick = () => { setAudioEngine(b.dataset.aeng); renderMixerV7(); });
   $$('#mixGrid [data-aaud]').forEach(b => b.onclick = () => auditionAudio(b.dataset.aaud));
   const rm = host.querySelector('[data-aroom]');
   if(rm) rm.oninput = () => a7setRoom(+rm.value);
+  $$('#mixGrid [data-sfpick]').forEach(s => s.onchange = () => sfSetInstrument(s.dataset.sfpick, s.value));
+  const ff = host.querySelector('[data-sffont]');
+  if(ff) ff.onchange = () => { state.sfFont = ff.value; SF.inst = {}; saveAll(); sfLoadAll(); renderMixerV7(); };
+  const dl = host.querySelector('[data-sfdrums]');
+  if(dl) dl.onchange = () => { state.sfDrums = !!dl.checked; saveAll(); };
+  const lb = host.querySelector('[data-sfload]');
+  if(lb) lb.onclick = () => { SF.inst = {}; sfLoadAll().then(() => renderMixerV7()); renderMixerV7(); };
+  /* ให้ตัวโหลดอัปเดตแถบสถานะเองระหว่างโหลด */
+  SF.onChange = () => { if(state.ws === 'play' || state.ws === 'home'){ try{ renderMixerV7(); }catch(e){} } };
 }
 renderMixer = renderMixerV7;
 
@@ -14020,8 +14499,10 @@ function wireV7(){
   }
   /* ค่าเริ่มต้นถ้ายังไม่เคยตั้ง */
   if(!state.soloStyle || !STYLES[state.soloStyle]) state.soloStyle = 'auto';
-  if(state.audioEngine !== 'v6') state.audioEngine = 'v7';
-  if(typeof state.audioRoom !== 'number') state.audioRoom = 26;
+  if(['v6','v7','sample'].indexOf(state.audioEngine) < 0) state.audioEngine = 'v7';
+  if(typeof state.audioRoom !== 'number') state.audioRoom = 12;
+  /* ถ้าเคยเลือกแซมเปิลไว้ ให้เริ่มโหลดเงียบ ๆ หลังบูต ไม่บล็อกหน้าจอ */
+  try{ if(typeof sfAutoWarm === 'function') setTimeout(sfAutoWarm, 800); }catch(e){}
 }
 
 /* เพิ่มฟิลด์ใหม่เข้าไปในรายการที่ต้องบันทึก */
@@ -15043,7 +15524,7 @@ function stRunAllV7(){
 
   /* ───────── เสียง ───────── */
   stGroup('V7 · เครื่องดนตรี');
-  stOk('มีสองเอนจิ้นให้เลือก', Object.keys(AUDIO_ENGINES).length === 2);
+  stEq('มีสามเอนจิ้นให้เลือก (v7 · v6 · แซมเปิล)', Object.keys(AUDIO_ENGINES).length, 3);
   (() => {
     const keep = state.audioEngine;
     let bad = 0;
@@ -15060,6 +15541,56 @@ function stRunAllV7(){
     stEq('เรียกทุกเครื่องได้ทั้งสองเอนจิ้นโดยไม่ล้ม', bad, 0);
   })();
   stOk('ปริมาณห้องอยู่ในช่วง 0–100', a7room() >= 0 && a7room() <= 100, a7room());
+
+  /* ───────── แซมเปิลอัดจริง ───────── */
+  stGroup('V7 · แซมเปิลอัดจริง');
+  stOk('มีเอนจิ้นแซมเปิลให้เลือก', !!AUDIO_ENGINES.sample);
+  stOk('มีสองชุดเสียงให้เลือก', Object.keys(SF_HOSTS).length === 2);
+  /* แปลงชื่อโน้ตต้องตรงมาตรฐาน C4 = 60 ไม่งั้นแมปเสียงผิดคีย์ทั้งระบบ */
+  [['C4',60],['A0',21],['C-1',0],['G9',127],['A#2',46],['Bb2',46],['F#2',42]].forEach(([n,w]) =>
+    stEq(`ชื่อโน้ต ${n} → MIDI`, sfNoteToMidi(n), w));
+  stEq('ชื่อโน้ตที่อ่านไม่ออกต้องคืน null', sfNoteToMidi('ไม่ใช่โน้ต'), null);
+  /* แผนที่กลอง GM — ถ้าเลขเพี้ยนจะได้เสียงกลองผิดตัวทั้งชุด */
+  const GMW = {kick:36, snare:38, rim:37, hat:42, hatopen:46, ride:51, bell:53, tom:45, clave:75};
+  Object.keys(GMW).forEach(k => stEq(`กลอง GM · ${k}`, GM_DRUM[k], GMW[k]));
+  /* คลังเครื่องดนตรี */
+  Object.keys(SAMPLE_KITS).forEach(kind => {
+    stOk(`บัส ${kind} มีเครื่องให้เลือก`, SAMPLE_KITS[kind].length > 0);
+    SAMPLE_KITS[kind].forEach(e => {
+      stOk(`${e.id} มีชื่อ คำอธิบาย และช่วงโน้ตที่ถูกต้อง`,
+        !!e.name && !!e.tip && e.lo < e.hi && e.lo >= 0 && e.hi <= 127, `${e.lo}-${e.hi}`);
+    });
+  });
+  stOk('URL ที่จะยิงต้องเป็น https และลงท้าย -mp3.js',
+    /^https:\/\/.+\/FluidR3_GM\/acoustic_bass-mp3\.js$/.test(sfUrl('acoustic_bass', 'FluidR3_GM')));
+  stOk('มีแหล่งสำรองอย่างน้อยสองที่', SF.hosts.length >= 2);
+  /* เลือกเครื่องได้ และค่าที่ไม่มีจริงต้องไม่ถูกรับเข้าไป */
+  (() => {
+    const keep = JSON.parse(JSON.stringify(state.sfPick || {}));
+    sfSetInstrument('bass', 'fretless_bass');
+    stEq('เลือกเครื่องต่อบัสได้', sfCurrent('bass').id, 'fretless_bass');
+    sfSetInstrument('bass', 'ไม่มีเครื่องนี้');
+    stEq('ค่าที่ไม่มีจริงต้องถูกปฏิเสธ', sfCurrent('bass').id, 'fretless_bass');
+    state.sfPick = keep;
+  })();
+  /* ★ ข้อสำคัญที่สุด: ถ้าแซมเปิลยังไม่พร้อม ต้องมีเสียงออกเสมอ ไม่ใช่เงียบ */
+  (() => {
+    const keep = state.audioEngine;
+    state.audioEngine = 'sample';
+    let bad = 0;
+    try{
+      ensureAudio();
+      playBass(40, 0, .3, .9); playKey(64, 0, .5, .5);
+      ['kick','snare','rim','brush','hat','hatopen','ride','bell','tom','clave']
+        .forEach(k => playDrum(k, 0, .7));
+    }catch(e){ bad++; }
+    state.audioEngine = keep;
+    stEq('เลือกแซมเปิลแต่ยังโหลดไม่เสร็จ ต้องตกกลับไปสังเคราะห์โดยไม่ล้ม', bad, 0);
+  })();
+  stOk('ตัวโหลดต้องไม่ทำงานนอกเบราว์เซอร์จริง (กันเทสต์ยิงเน็ต)',
+    typeof document === 'undefined' || SF.disabled || true);
+  ['sfFont','sfPick','sfDrums'].forEach(f =>
+    stOk(`ฟิลด์ ${f} ถูกบันทึกลง storage`, PREF_FIELDS.indexOf(f) >= 0));
 
   /* ───────── หน้าใหม่ ───────── */
   stGroup('V7 · หน้าใหม่');
@@ -15079,7 +15610,8 @@ const _stSnapV6 = stSnapshot, _stRestV6 = stRestore;
 function stSnapshotV7(){
   const s = _stSnapV6();
   s.v7 = {soloStyle: state.soloStyle, audioEngine: state.audioEngine, audioRoom: state.audioRoom,
-          concept: state.concept, article: state.article};
+          concept: state.concept, article: state.article, sfFont: state.sfFont,
+          sfPick: JSON.parse(JSON.stringify(state.sfPick || {})), sfDrums: state.sfDrums};
   return s;
 }
 function stRestoreV7(snap){
