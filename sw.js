@@ -1,7 +1,7 @@
 /* Hardmango Bass Lab — service worker
    หน้าที่: เก็บไฟล์ไว้ในเครื่องเพื่อให้เปิดใช้ได้แม้ไม่มีเน็ต
    เปลี่ยนเลข CACHE ทุกครั้งที่อัปเวอร์ชันใหม่ เพื่อให้เบราว์เซอร์โหลดของใหม่ */
-const CACHE = 'hardmango-v7.1';
+const CACHE = 'hardmango-v7.3';
 const FILES = ['./', './index.html', './manifest.json'];
 
 /* ไฟล์เครื่องดนตรีจากภายนอก — ก้อนใหญ่และไม่มีวันเปลี่ยน

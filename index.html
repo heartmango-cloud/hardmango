@@ -13860,6 +13860,370 @@ function sfAutoWarm(){
 }
 
 
+/* ══════ v7.2: ไฟล์เสียงของผู้ใช้เอง (ทับ playBass/playKey/playDrum ชั้นบนสุด): _p39_usersamples7.js ══════ */
+/* =========================================================================
+   V7.2 — ใส่ไฟล์เสียงของคุณเอง
+
+   ทำไมถึงออกแบบเป็น "ลากโฟลเดอร์ใส่แอป" แทนการอัปขึ้น GitHub:
+   · ไม่ติดลิมิตขนาดของ repo (ไฟล์เสียงดี ๆ หลายร้อยเมกะไบต์)
+   · ไม่ต้องตั้งชื่อไฟล์ตามกฎ — ระบบอ่านชื่อไฟล์เดาโน้ตให้เอง
+   · ไม่ต้องอัปใหม่ทุกครั้งที่อัปเวอร์ชันแอป
+   · เก็บใน IndexedDB จึงอยู่ถาวรและใช้ออฟไลน์ได้ทันที
+
+   ลำดับการเลือกเสียงของแต่ละบัส (ตกทีละชั้น ไม่มีทางเงียบ):
+   ไฟล์ของผู้ใช้ → แซมเปิลจาก CDN → สังเคราะห์ V7 → สังเคราะห์ V6
+   ========================================================================= */
+
+const US = {
+  db: null, ready: false,
+  buf: {bass:{}, keys:{}, drums:{}},   /* kind -> {key: AudioBuffer} */
+  meta: {bass:{}, keys:{}, drums:{}},  /* kind -> {key: {name, midi|piece}} */
+  busy: false, log: [],
+  onChange: null,
+};
+const US_DB = 'hardmango-samples', US_STORE = 'samples';
+
+/* ---------- IndexedDB ---------- */
+function usOpen(){
+  if(US.db) return Promise.resolve(US.db);
+  return new Promise((resolve, reject) => {
+    if(typeof indexedDB === 'undefined'){ reject(new Error('เบราว์เซอร์นี้ไม่รองรับ IndexedDB')); return; }
+    const rq = indexedDB.open(US_DB, 1);
+    rq.onupgradeneeded = () => {
+      const db = rq.result;
+      if(!db.objectStoreNames.contains(US_STORE)) db.createObjectStore(US_STORE, {keyPath:'id'});
+    };
+    rq.onsuccess = () => { US.db = rq.result; resolve(US.db); };
+    rq.onerror = () => reject(rq.error || new Error('เปิดฐานข้อมูลไม่ได้'));
+  });
+}
+function usTx(mode){
+  return usOpen().then(db => db.transaction(US_STORE, mode).objectStore(US_STORE));
+}
+function usPut(rec){
+  return usTx('readwrite').then(st => new Promise((res, rej) => {
+    const r = st.put(rec); r.onsuccess = () => res(); r.onerror = () => rej(r.error);
+  }));
+}
+function usAll(){
+  return usTx('readonly').then(st => new Promise((res, rej) => {
+    const r = st.getAll(); r.onsuccess = () => res(r.result || []); r.onerror = () => rej(r.error);
+  }));
+}
+function usClearKind(kind){
+  return usAll().then(rows => usTx('readwrite').then(st => {
+    rows.filter(r => !kind || r.kind === kind).forEach(r => st.delete(r.id));
+    if(kind){ US.buf[kind] = {}; US.meta[kind] = {}; }
+    else { ['bass','keys','drums'].forEach(k => { US.buf[k] = {}; US.meta[k] = {}; }); }
+  }));
+}
+
+/* =========================================================================
+   อ่านชื่อไฟล์ → หาว่าเป็นโน้ตอะไร หรือกลองชิ้นไหน
+   ตั้งใจให้ยืดหยุ่น เพราะแต่ละคลังตั้งชื่อไม่เหมือนกันเลย
+   Salamander: A0v1.wav · C#4v8.wav
+   Karoryfer : ชื่อยาวมีคำอธิบายปน
+   ทั่วไป     : bass_C2.wav · 60.wav · Piano.F#3.mp3
+   ========================================================================= */
+const US_NOTE_RE = /([A-Ga-g])\s*(#|s|♯|b|♭)?\s*(-1|-?\d)(?![0-9])/g;
+function usNoteFromName(fn){
+  const base = String(fn).replace(/^.*[\\/]/, '').replace(/\.[a-z0-9]+$/i, '');
+  /* ทั้งชื่อเป็นตัวเลขล้วน = เลข MIDI ตรง ๆ */
+  if(/^\d{1,3}$/.test(base)){
+    const n = +base;
+    if(n >= 0 && n <= 127) return n;
+  }
+  /* หาโน้ตจากขวาไปซ้าย — ชื่อมักลงท้ายด้วยโน้ตมากกว่าขึ้นต้น */
+  const hits = [];
+  let m; US_NOTE_RE.lastIndex = 0;
+  while((m = US_NOTE_RE.exec(base))) hits.push(m);
+  if(!hits.length) return null;
+  const h = hits[hits.length - 1];
+  const pcv = SF_PC[h[1].toUpperCase()];
+  if(pcv == null) return null;
+  const acc = (h[2] === '#' || h[2] === 's' || h[2] === '♯') ? 1
+            : (h[2] === 'b' || h[2] === '♭') ? -1 : 0;
+  const oct = parseInt(h[3], 10);
+  const midi = (oct + 1) * 12 + pcv + acc;
+  return (midi >= 0 && midi <= 127) ? midi : null;
+}
+/* ชั้นความแรง (velocity layer) — เอาแค่ชั้นเดียวพอ ไม่งั้นไฟล์บวมสิบเท่า */
+function usVelLayer(fn){
+  const m = /[_\-.]?v(?:el)?(\d{1,2})(?![0-9])/i.exec(String(fn).replace(/^.*[\\/]/, ''));
+  return m ? +m[1] : null;
+}
+const US_PIECES = [
+  {id:'kick',    keys:['kick','bassdrum','bass_drum','bd','kik']},
+  {id:'snare',   keys:['snare','sd','sn']},
+  {id:'rim',     keys:['rim','sidestick','side_stick','crossstick','cross_stick','stick']},
+  {id:'hatopen', keys:['openhat','hat_open','hihat_open','hhopen','hh_open','open_hh','opened']},
+  {id:'hat',     keys:['hihat','hi_hat','hat','hh','closed']},
+  {id:'bell',    keys:['ridebell','ride_bell','bell','cup']},
+  {id:'ride',    keys:['ride','cymbal','crash']},
+  {id:'brush',   keys:['brush','swirl','sweep','swish','circle']},
+  {id:'tom',     keys:['tom','floor']},
+  {id:'clave',   keys:['clave','woodblock','wood_block','click']},
+];
+function usPieceFromName(fn){
+  const s = String(fn).replace(/^.*[\\/]/, '').toLowerCase();
+  /* เรียงลำดับสำคัญ — 'openhat' ต้องถูกจับก่อน 'hat' และ 'ridebell' ก่อน 'ride' */
+  for(const p of US_PIECES) for(const k of p.keys) if(s.indexOf(k) >= 0) return p.id;
+  return null;
+}
+
+/* =========================================================================
+   นำเข้าไฟล์
+   ========================================================================= */
+const US_AUDIO_RE = /\.(wav|wave|mp3|ogg|oga|m4a|aac|flac|opus|webm)$/i;
+function usFileKind(f, forced){
+  if(forced) return forced;
+  const p = String(f.webkitRelativePath || f.name).toLowerCase();
+  /* ★ ห้ามบังคับให้คำอยู่ต้นคำ — โฟลเดอร์จริงชื่อ "MyBass" หรือ "UprightBass"
+     ซึ่งคำว่า bass ไม่ได้อยู่หลังตัวคั่น (เจอตอนทดสอบ)
+     แต่ต้องกัน "bassoon" ไว้ ไม่งั้นบาสซูนจะกลายเป็นเบส */
+  if(/drum|kit|perc|kick|snare|hihat|hi-hat|\bhat\b|ride|cymbal|brush|tom\b/.test(p)) return 'drums';
+  if(/bassoon/.test(p)) return 'keys';
+  if(/bass|contrabass|upright|double.?bass|dbass/.test(p)) return 'bass';
+  return 'keys';
+}
+/* จำกัดจำนวนไฟล์ต่อบัส ไม่ให้กินพื้นที่จนเบราว์เซอร์ปฏิเสธ */
+const US_MAX = {bass: 64, keys: 96, drums: 64};
+
+async function usImport(files, opts){
+  const o = opts || {};
+  if(US.busy) return {ok:0, skip:0, err:'กำลังนำเข้าอยู่'};
+  US.busy = true; US.log = [];
+  const ctx = ensureAudio();
+  let ok = 0, skip = 0;
+  try{
+    const list = Array.from(files || []).filter(f => US_AUDIO_RE.test(f.name));
+    if(!list.length){ US.busy = false; return {ok:0, skip:0, err:'ไม่พบไฟล์เสียงที่รองรับ'}; }
+
+    /* ---- จัดกลุ่มตามบัส แล้วคัดให้เหลือชั้นความแรงเดียว ---- */
+    const byKind = {bass:[], keys:[], drums:[]};
+    list.forEach(f => byKind[usFileKind(f, o.kind)].push(f));
+
+    for(const kind of ['bass','keys','drums']){
+      let group = byKind[kind];
+      if(!group.length) continue;
+
+      if(kind === 'drums'){
+        /* กลอง: หนึ่งชิ้นเอาหนึ่งไฟล์ (ไฟล์แรกที่เจอ) */
+        const seen = {};
+        group = group.filter(f => {
+          const p = usPieceFromName(f.name) || usPieceFromName(f.webkitRelativePath || '');
+          if(!p || seen[p]) return false;
+          seen[p] = true; f.__piece = p; return true;
+        });
+      } else {
+        /* โน้ต: ถ้ามีหลายชั้นความแรง เลือกชั้นกลางค่อนไปทางแรง
+           (ชั้นเบาสุดมักฟังไม่ออกเวลาเล่นกับวง) */
+        const withNote = group.map(f => ({f, midi: usNoteFromName(f.webkitRelativePath || f.name), v: usVelLayer(f.name)}))
+                              .filter(x => x.midi != null);
+        const layers = [...new Set(withNote.map(x => x.v).filter(v => v != null))].sort((a, b) => a - b);
+        const pick = layers.length ? layers[Math.min(layers.length - 1, Math.floor(layers.length * 0.66))] : null;
+        const chosen = {};
+        withNote.forEach(x => {
+          if(pick != null && x.v != null && x.v !== pick) return;
+          if(chosen[x.midi]) return;
+          chosen[x.midi] = x; x.f.__midi = x.midi;
+        });
+        group = Object.values(chosen).map(x => x.f);
+        /* ถ้าโน้ตเยอะเกินโควตา ให้เว้นระยะเอาแทนการตัดท้าย
+           (ตัดท้ายจะเหลือแต่โน้ตต่ำ ระบบยืดเสียงขึ้นสูงแล้วเพี้ยน) */
+        if(group.length > US_MAX[kind]){
+          const step = group.length / US_MAX[kind];
+          group.sort((a, b) => a.__midi - b.__midi);
+          group = group.filter((_, i) => i % Math.ceil(step) === 0);
+        }
+      }
+
+      for(const f of group){
+        try{
+          const bytes = await f.arrayBuffer();
+          const key = kind === 'drums' ? f.__piece : String(f.__midi);
+          if(key == null){ skip++; continue; }
+          /* ถอดรหัสทันทีเพื่อยืนยันว่าเบราว์เซอร์เล่นไฟล์นี้ได้จริง
+             ต้องคัดลอกบัฟเฟอร์ก่อน เพราะ decodeAudioData "กิน" ตัวต้นฉบับไป */
+          const copy = bytes.slice(0);
+          const buf = await new Promise((res, rej) => {
+            try{
+              const p = ctx.decodeAudioData(copy, res, rej);
+              if(p && p.then) p.then(res, rej);
+            }catch(e){ rej(e); }
+          });
+          US.buf[kind][key] = buf;
+          US.meta[kind][key] = {name: f.name, midi: kind === 'drums' ? null : f.__midi, piece: f.__piece || null};
+          await usPut({id: kind + '/' + key, kind, key, name: f.name, bytes});
+          ok++;
+        }catch(e){
+          skip++;
+          if(US.log.length < 8) US.log.push(f.name + ' — ' + ((e && e.message) || 'อ่านไม่ได้'));
+        }
+      }
+    }
+  }catch(e){
+    US.busy = false;
+    return {ok, skip, err:(e && e.message) || String(e)};
+  }
+  US.busy = false;
+  saveAll();
+  if(US.onChange) US.onChange();
+  return {ok, skip};
+}
+
+/* โหลดของที่เคยใส่ไว้กลับมาตอนเปิดแอป */
+async function usRestore(){
+  if(US.ready) return US;
+  try{
+    const ctx = ensureAudio();
+    const rows = await usAll();
+    for(const r of rows){
+      if(!US.buf[r.kind]) continue;
+      try{
+        const copy = r.bytes.slice(0);
+        const buf = await new Promise((res, rej) => {
+          const p = ctx.decodeAudioData(copy, res, rej);
+          if(p && p.then) p.then(res, rej);
+        });
+        US.buf[r.kind][r.key] = buf;
+        US.meta[r.kind][r.key] = {name: r.name, midi: r.kind === 'drums' ? null : +r.key, piece: r.kind === 'drums' ? r.key : null};
+      }catch(e){}
+    }
+  }catch(e){}
+  US.ready = true;
+  if(US.onChange) US.onChange();
+  return US;
+}
+
+/* ---------- ข้อมูลสรุปสำหรับ UI ---------- */
+function usCount(kind){ return Object.keys(US.buf[kind] || {}).length; }
+function usHas(kind){ return usCount(kind) > 0; }
+function usRange(kind){
+  const ks = Object.keys(US.buf[kind] || {}).map(Number).filter(n => !isNaN(n)).sort((a, b) => a - b);
+  if(!ks.length) return null;
+  return {lo: ks[0], hi: ks[ks.length - 1],
+          loName: usMidiName(ks[0]), hiName: usMidiName(ks[ks.length - 1])};
+}
+function usMidiName(m){ return nn(mod12(m)) + (Math.floor(m / 12) - 1); }
+function usPieces(){ return Object.keys(US.buf.drums || {}); }
+
+/* ปรับอ็อกเทฟ — บางคลังใช้ C3 = 60 บางคลังใช้ C4 = 60 ต่างกันทั้งอ็อกเทฟ
+   แทนที่จะเดา ให้ผู้ใช้กดเลื่อนแล้วฟังเอง เร็วกว่าและไม่มีทางผิด */
+function usShift(kind){ return clamp(a7num((state.usShift || {})[kind], 0), -2, 2); }
+function usSetShift(kind, v){
+  state.usShift = Object.assign({}, state.usShift, {[kind]: clamp(v | 0, -2, 2)});
+  saveAll();
+  if(US.onChange) US.onChange();
+}
+
+/* ---------- เล่น ---------- */
+function usPlayNote(kind, midi, when, dur, vel, bus, send){
+  const bank = US.buf[kind];
+  if(!bank) return false;
+  const want = Math.round(midi) - usShift(kind) * 12;
+  const keys = Object.keys(bank).map(Number).filter(n => !isNaN(n));
+  if(!keys.length) return false;
+  let best = keys[0], bd = 1e9;
+  for(const k of keys){ const d = Math.abs(k - want); if(d < bd){ bd = d; best = k; } }
+  /* ถ้าต้องยืดเกินหนึ่งอ็อกเทฟ เสียงจะเพี้ยนจนใช้ไม่ได้ — ยอมตกไปใช้ชั้นถัดไปดีกว่า */
+  if(bd > 12) return false;
+  return usFire(bank[best], Math.pow(2, (want - best) / 12), when, dur, vel, bus, send);
+}
+function usPlayPiece(piece, when, dur, vel, bus, send){
+  const b = US.buf.drums && US.buf.drums[piece];
+  if(!b) return false;
+  return usFire(b, 1, when, dur, vel, bus, send);
+}
+function usFire(buf, rate, when, dur, vel, bus, send){
+  const ctx = AU.ctx;
+  if(!ctx || !buf || !bus) return false;
+  try{
+    const src = ctx.createBufferSource();
+    src.buffer = buf;
+    src.playbackRate.value = rate;
+    const g = ctx.createGain();
+    const peak = clamp(a7num(vel, .8), 0, 1);
+    g.gain.setValueAtTime(0.0001, when);
+    g.gain.linearRampToValueAtTime(peak, when + 0.004);
+    const rel = clamp(dur * 0.25, 0.05, 0.35);
+    g.gain.setTargetAtTime(0.0001, when + Math.max(0.06, dur), rel * 0.4);
+    src.connect(g); g.connect(bus);
+    if(send) a7send(g, send);
+    src.start(when);
+    src.stop(when + Math.max(0.12, dur) + rel + 0.3);
+    return true;
+  }catch(e){ return false; }
+}
+
+/* =========================================================================
+   เสียบเข้าสายเสียง — อยู่ชั้นบนสุด ใช้ก่อนทุกอย่าง
+   ========================================================================= */
+function usActive(){ return state.audioEngine === 'user' || state.audioEngine === 'sample'; }
+const _bassBeforeUS = playBass, _keyBeforeUS = playKey, _drumBeforeUS = playDrum;
+
+playBass = function(midi, when, dur, vel){
+  if(usActive() && usHas('bass') &&
+     usPlayNote('bass', clamp(midi, 20, 72), when, dur, a7num(vel, .9) * 0.85, AU.bus.bass, 0.03)) return;
+  return _bassBeforeUS(midi, when, dur, vel);
+};
+playKey = function(midi, when, dur, vel){
+  if(usActive() && usHas('keys') &&
+     usPlayNote('keys', clamp(midi, 30, 100), when, dur, a7num(vel, .5) * 0.8, AU.bus.keys, 0.12)) return;
+  return _keyBeforeUS(midi, when, dur, vel);
+};
+playDrum = function(kind, when, vel){
+  if(usActive() && usHas('drums')){
+    const send = (kind === 'ride' || kind === 'bell') ? 0.25 : 0.08;
+    const dur  = (kind === 'ride' || kind === 'bell') ? 1.2 : 0.4;
+    if(usPlayPiece(kind, when, dur, a7num(vel, .7) * 0.85, AU.bus.drums, send)) return;
+    /* ไม่มีชิ้นนั้น — ลองชิ้นใกล้เคียงก่อนตกไปสังเคราะห์ */
+    const alt = {brush:'snare', hatopen:'hat', bell:'ride', clave:'rim', tom:'snare'}[kind];
+    if(alt && usPlayPiece(alt, when, dur, a7num(vel, .7) * 0.7, AU.bus.drums, send)) return;
+  }
+  return _drumBeforeUS(kind, when, vel);
+};
+
+/* เพิ่มเป็นตัวเลือกที่สี่ */
+Object.assign(AUDIO_ENGINES, {
+  user: {name:'เสียงที่ผมใส่เอง', desc:'ไฟล์เสียงที่คุณลากใส่แอป — คุณภาพขึ้นกับคลังที่เลือก ใช้ออฟไลน์ได้เลย'},
+});
+const _setEngineBeforeUS = setAudioEngine;
+setAudioEngine = function(which){
+  if(which === 'user'){
+    state.audioEngine = 'user';
+    saveAll();
+    usRestore().then(() => { try{ renderMixer(); }catch(e){} });
+    const n = ['bass','keys','drums'].filter(usHas).length;
+    toast(n ? `ใช้เสียงของคุณ ${n}/3 บัส` : 'ยังไม่มีไฟล์ — ลากโฟลเดอร์มาวางในกล่องด้านล่าง');
+    try{ renderMixer(); }catch(e){}
+    return;
+  }
+  return _setEngineBeforeUS(which);
+};
+const _auditionBeforeUS = auditionAudio;
+auditionAudio = function(which){
+  if(which !== 'user') return _auditionBeforeUS(which);
+  const c = ensureAudio(); if(!c) return;
+  const keep = state.audioEngine;
+  state.audioEngine = 'user';
+  const t = c.currentTime + 0.06;
+  [40, 43, 47, 50].forEach((m, i) => playBass(m, t + i * 0.26, 0.24, 0.9));
+  [64, 68, 71, 74].forEach(m => playKey(m, t + 0.52, 0.9, 0.5));
+  ['ride','ride','bell','ride'].forEach((k, i) => playDrum(k, t + i * 0.26, 0.7));
+  playDrum('kick', t, 0.8);
+  playDrum('brush', t + 0.52, 0.6);
+  state.audioEngine = keep;
+};
+
+(function usDefaults(){
+  try{
+    ['usShift'].forEach(f => { if(PREF_FIELDS.indexOf(f) < 0) PREF_FIELDS.push(f); });
+  }catch(e){}
+  if(!state.usShift || typeof state.usShift !== 'object') state.usShift = {bass:0, keys:0, drums:0};
+})();
+
+
 /* ══════ v7: UI + wiring ทั้งหมด (ทับ renderAll/wire/renderMixer): _p36_ui7.js ══════ */
 /* =========================================================================
    V7 — UI และการต่อสายทั้งหมด
@@ -14328,6 +14692,132 @@ function renderArticles(){
 /* =========================================================================
    ต่อของใหม่เข้าหน้าเดิม
    ========================================================================= */
+/* =========================================================================
+   กล่องใส่ไฟล์เสียงของผู้ใช้เอง
+   ========================================================================= */
+const US_KIND_LABEL = {bass:'เบส', keys:'เปียโน / คอร์ด', drums:'กลอง'};
+function v7UserSampleBox(){
+  const row = kind => {
+    const n = usCount(kind), r = usRange(kind), sh = usShift(kind);
+    return `<div class="lbox" style="margin-top:6px">
+      <span>${esc(US_KIND_LABEL[kind])} — ${n ? `<b style="color:#8be7be">${n} ไฟล์</b>` : '<span style="opacity:.55">ยังไม่มี</span>'}</span>
+      ${n ? `<p class="legend" style="margin:3px 0 0">
+        ${kind === 'drums'
+          ? 'ชิ้นที่เจอ: ' + esc(usPieces().join(' · '))
+          : `ช่วงโน้ต ${esc(r ? r.loName + ' – ' + r.hiName : '')}`}</p>` : ''}
+      ${n && kind !== 'drums' ? `<div class="row" style="gap:5px;margin-top:5px;align-items:center">
+        <span style="font-size:10px;opacity:.7">อ็อกเทฟ</span>
+        <button class="btn tiny" data-usoct="${kind}|-1">−1</button>
+        <b style="min-width:26px;text-align:center">${sh > 0 ? '+' : ''}${sh}</b>
+        <button class="btn tiny" data-usoct="${kind}|1">+1</button>
+        <button class="btn tiny" data-ustest="${kind}">▶ ลองฟัง</button>
+        <button class="btn tiny warn" data-usclear="${kind}">ลบ</button>
+      </div>` : n ? `<div class="row" style="gap:5px;margin-top:5px">
+        <button class="btn tiny" data-ustest="${kind}">▶ ลองฟัง</button>
+        <button class="btn tiny warn" data-usclear="${kind}">ลบ</button></div>` : ''}
+    </div>`;
+  };
+  return `<div style="margin-top:10px;border-top:1px solid rgba(255,255,255,.08);padding-top:8px">
+    <div id="usDrop" style="border:1.5px dashed rgba(139,231,190,.45);border-radius:10px;
+         padding:14px;text-align:center;cursor:pointer;background:rgba(139,231,190,.04)">
+      <b style="font-size:12.5px">ลากโฟลเดอร์เสียงมาวางตรงนี้</b>
+      <p class="legend" style="margin:5px 0 0">หรือกดเพื่อเลือกโฟลเดอร์ · รองรับ wav · mp3 · ogg · flac · m4a</p>
+      <p class="legend" style="margin:3px 0 0;opacity:.65">
+        ระบบอ่านชื่อไฟล์เดาโน้ตให้เอง ไม่ต้องเปลี่ยนชื่อ · เก็บไว้ในเครื่องคุณ ไม่ส่งไปไหน</p>
+    </div>
+    <input id="usFile" type="file" multiple webkitdirectory directory style="display:none">
+    <input id="usFile2" type="file" multiple accept="audio/*" style="display:none">
+    <div class="row" style="gap:5px;margin-top:6px;flex-wrap:wrap">
+      <button class="btn tiny" id="usPickFolder">เลือกโฟลเดอร์</button>
+      <button class="btn tiny" id="usPickFiles">เลือกไฟล์</button>
+      <button class="btn tiny warn" id="usClearAll">ลบทั้งหมด</button>
+    </div>
+    <div id="usStatus" class="legend" style="margin-top:6px"></div>
+    ${['bass','keys','drums'].map(row).join('')}
+    <p class="legend" style="margin-top:6px">
+      ถ้าเสียงสูงหรือต่ำไปทั้งชุด กด −1 / +1 อ็อกเทฟ — คลังแต่ละเจ้าใช้มาตรฐานตัวเลขอ็อกเทฟไม่ตรงกัน ·
+      ถ้าบัสไหนไม่มีไฟล์ ระบบจะใช้แซมเปิลจากเน็ตหรือเสียงสังเคราะห์แทนให้เอง</p>
+  </div>`;
+}
+function v7WireUserSamples(host){
+  const st = $('#usStatus');
+  const say = t => { if(st) st.innerHTML = t; };
+  const run = files => {
+    if(!files || !files.length) return;
+    say(`<b style="color:#ffd98b">กำลังอ่าน ${files.length} ไฟล์…</b>`);
+    usImport(files).then(r => {
+      if(r.err) say(`<b style="color:#ff9fb0">${esc(r.err)}</b>`);
+      else say(`<b style="color:#8be7be">ใส่แล้ว ${r.ok} ไฟล์</b>` +
+        (r.skip ? ` · ข้าม ${r.skip} ไฟล์` : '') +
+        (US.log.length ? `<br><small style="opacity:.6">${US.log.map(esc).join('<br>')}</small>` : ''));
+      renderMixer();
+    });
+  };
+  const dz = $('#usDrop');
+  if(dz){
+    dz.onclick = () => { const f = $('#usFile'); if(f) f.click(); };
+    dz.ondragover = e => { e.preventDefault(); dz.style.background = 'rgba(139,231,190,.14)'; };
+    dz.ondragleave = () => { dz.style.background = 'rgba(139,231,190,.04)'; };
+    dz.ondrop = e => {
+      e.preventDefault(); dz.style.background = 'rgba(139,231,190,.04)';
+      const dt = e.dataTransfer;
+      if(!dt) return;
+      /* ลากทั้งโฟลเดอร์ต้องเดินเข้าไปอ่านทีละชั้น — dt.files จะได้แค่ระดับบนสุด */
+      const items = dt.items ? Array.from(dt.items) : [];
+      const entries = items.map(i => i.webkitGetAsEntry && i.webkitGetAsEntry()).filter(Boolean);
+      if(entries.length && entries.some(en => en.isDirectory)){
+        v7WalkEntries(entries).then(run);
+      } else run(dt.files);
+    };
+  }
+  const pf = $('#usPickFolder'); if(pf) pf.onclick = () => { const f = $('#usFile'); if(f) f.click(); };
+  const pl = $('#usPickFiles'); if(pl) pl.onclick = () => { const f = $('#usFile2'); if(f) f.click(); };
+  const i1 = $('#usFile');  if(i1) i1.onchange = () => run(i1.files);
+  const i2 = $('#usFile2'); if(i2) i2.onchange = () => run(i2.files);
+  const ca = $('#usClearAll');
+  if(ca) ca.onclick = () => { if(confirm('ลบไฟล์เสียงที่ใส่ไว้ทั้งหมด?')) usClearKind(null).then(() => renderMixer()); };
+  $$('#mixGrid [data-usclear]').forEach(b => b.onclick = () =>
+    usClearKind(b.dataset.usclear).then(() => renderMixer()));
+  $$('#mixGrid [data-usoct]').forEach(b => b.onclick = () => {
+    const [k, d] = b.dataset.usoct.split('|');
+    usSetShift(k, usShift(k) + (+d)); renderMixer();
+  });
+  $$('#mixGrid [data-ustest]').forEach(b => b.onclick = () => {
+    const c = ensureAudio(); if(!c) return;
+    const k = b.dataset.ustest, t = c.currentTime + 0.06;
+    const keep = state.audioEngine; state.audioEngine = 'user';
+    if(k === 'bass') [40, 43, 47, 52].forEach((m, i) => playBass(m, t + i * 0.3, 0.28, 0.9));
+    else if(k === 'keys') { [60, 64, 67, 71].forEach(m => playKey(m, t, 1.4, 0.55)); }
+    else ['kick','snare','hat','ride','brush','rim'].forEach((p, i) => playDrum(p, t + i * 0.3, 0.8));
+    state.audioEngine = keep;
+  });
+  US.onChange = () => { try{ renderMixer(); }catch(e){} };
+  if(!US.ready) usRestore().then(() => { try{ renderMixer(); }catch(e){} });
+}
+/* เดินเข้าไปอ่านไฟล์ในโฟลเดอร์ที่ลากมา (รวมโฟลเดอร์ย่อย) */
+function v7WalkEntries(entries){
+  const out = [];
+  const readDir = dir => new Promise(res => {
+    const rd = dir.createReader();
+    const acc = [];
+    const step = () => rd.readEntries(list => {
+      if(!list.length){ res(acc); return; }
+      acc.push(...list); step();
+    }, () => res(acc));
+    step();
+  });
+  const walk = async en => {
+    if(!en) return;
+    if(en.isFile){
+      await new Promise(res => en.file(f => { out.push(f); res(); }, res));
+    } else if(en.isDirectory){
+      const kids = await readDir(en);
+      for(const k of kids) await walk(k);
+    }
+  };
+  return (async () => { for(const e of entries) await walk(e); return out; })();
+}
+
 /* มิกเซอร์ — เลือกเครื่องดนตรีแบบ iReal Pro + เอนจิ้นเสียง + ปริมาณห้อง */
 const _renderMixerV6 = renderMixer;
 function renderMixerV7(){
@@ -14388,10 +14878,13 @@ function renderMixerV7(){
         ถ้าโหลดไม่สำเร็จหรือเน็ตหลุด ระบบจะกลับไปใช้เสียงสังเคราะห์เองโดยไม่เงียบ</p>
     </div>` : ''}
 
+    ${eng === 'user' ? v7UserSampleBox() : ''}
+
     <label style="display:block;margin-top:10px;font-size:10px;opacity:.7">ห้อง (reverb) <b>${a7room()}</b></label>
     <input type="range" class="range" min="0" max="100" value="${a7room()}" data-aroom>
     <p class="legend">เสียงที่แห้งสนิทฟังเป็นของสังเคราะห์เสมอ ห้องเล็กน้อยช่วยได้ — แต่มากไปจะเบลอรวมกันทั้งวง</p>`;
   host.appendChild(extra);
+  if(eng === 'user') v7WireUserSamples(host);
 
   $$('#mixGrid [data-aeng]').forEach(b => b.onclick = () => { setAudioEngine(b.dataset.aeng); renderMixerV7(); });
   $$('#mixGrid [data-aaud]').forEach(b => b.onclick = () => auditionAudio(b.dataset.aaud));
@@ -14518,6 +15011,172 @@ function wireV7(){
 const _wireV6chain = wire;
 function wireV7chain(){ _wireV6chain(); try{ wireV7(); }catch(e){ console.warn('wireV7:', e.message); } }
 wire = wireV7chain;
+
+
+/* ══════ v7.3: เสียงดีตั้งแต่เปิด + ยุบมิกเซอร์ (ต้องมาหลัง _p36 เพราะทับ renderMixer): _p40_easyaudio7.js ══════ */
+/* =========================================================================
+   V7.3 — เสียงดีตั้งแต่เปิด ไม่ต้องตั้งอะไร
+
+   ผมทำพลาดเองในรอบที่แล้ว: สร้างของที่ใช้ได้จริงแต่ "ต้องไปหาปุ่มเอง"
+   ผู้ใช้เปิดแอปมาแล้วกดเล่น จะได้ยินเสียงสังเคราะห์เสมอ เพราะค่าเริ่มต้นเป็น v7
+   ส่วนแซมเปิลจริงถูกซ่อนอยู่ในมิกเซอร์ซึ่งไม่มีเหตุผลให้ไปเปิด
+
+   หลักที่ควรยึด: ค่าเริ่มต้นต้องเป็นตัวเลือกที่ดีที่สุดที่ทำได้ในสภาพนั้น ๆ
+   ไม่ใช่ตัวเลือกที่ปลอดภัยที่สุดสำหรับคนเขียนโปรแกรม
+   ========================================================================= */
+
+/* เลือกเสียงที่ดีที่สุดที่ใช้ได้ตอนนี้ โดยไม่ต้องถามใคร */
+function bestEngineNow(){
+  if(['bass','keys','drums'].some(k => (typeof usHas === 'function') && usHas(k))) return 'user';
+  return sfOnline() ? 'sample' : 'v7';
+}
+/* ผู้ใช้เคยเลือกเองหรือยัง — ถ้าเคย ห้ามระบบไปเปลี่ยนทับ */
+function audioChosen(){ return state.audioChosen === true; }
+
+const _setEngineBeforeEasy = setAudioEngine;
+setAudioEngine = function(which){
+  state.audioChosen = true;          /* กดเองแล้ว = ตั้งใจ ระบบจะไม่ยุ่งอีก */
+  return _setEngineBeforeEasy(which);
+};
+
+/* ---------- โหลดอัตโนมัติครั้งแรกที่มีเสียง ----------
+   ต้องรอ ensureAudio() สำเร็จก่อน เพราะเบราว์เซอร์ไม่ยอมให้เปิดระบบเสียง
+   จนกว่าผู้ใช้จะแตะอะไรสักอย่าง — จึงเกาะจังหวะ "กดเล่น" เป็นตัวจุดชนวน */
+let _easyDone = false;
+function easyAudioBoot(){
+  if(_easyDone) return;
+  if(!AU.ctx) return;                /* ยังไม่มีระบบเสียง = ยังไม่ถึงเวลา */
+  _easyDone = true;
+  try{ if(typeof usRestore === 'function') usRestore().then(() => { try{ renderMixer(); }catch(e){} }); }catch(e){}
+  if(audioChosen()) return;          /* เคารพการเลือกของผู้ใช้ */
+
+  const want = bestEngineNow();
+  state.audioEngine = want;
+  if(want !== 'sample'){ try{ renderMixer(); }catch(e){} return; }
+
+  toast('กำลังโหลดเสียงเครื่องดนตรีจริง — รอสักครู่ ระหว่างนี้เล่นได้ปกติ');
+  sfLoadAll().then(() => {
+    const ok = ['bass','keys','drums'].filter(sfReady);
+    if(ok.length) toast(`เสียงเครื่องดนตรีจริงพร้อมแล้ว (${ok.length}/3)`);
+    else {
+      /* โหลดไม่ได้ก็ไม่เป็นไร — กลับไปสังเคราะห์เงียบ ๆ ไม่ต้องให้ผู้ใช้ทำอะไร */
+      state.audioEngine = 'v7';
+      toast('โหลดเสียงจริงไม่ได้ ใช้เสียงสังเคราะห์แทน (ยังเล่นได้ครบทุกอย่าง)');
+    }
+    saveAll();
+    try{ renderMixer(); }catch(e){}
+  });
+}
+const _ensureAudioBeforeEasy = ensureAudio;
+ensureAudio = function(){
+  const c = _ensureAudioBeforeEasy();
+  if(c && !_easyDone) setTimeout(easyAudioBoot, 0);
+  return c;
+};
+
+/* กลับไปค่าที่แนะนำทั้งหมดในปุ่มเดียว — ทางออกเวลาปรับจนงงว่าเปลี่ยนอะไรไปบ้าง */
+function resetAudioDefaults(){
+  state.audioChosen = false;
+  state.audioRoom = 12;
+  state.sfFont = 'FluidR3_GM';
+  state.sfPick = {bass:'acoustic_bass', keys:'acoustic_grand_piano', drums:'percussion'};
+  state.sfDrums = true;
+  state.usShift = {bass:0, keys:0, drums:0};
+  /* ★ ต้องแก้ค่าในอ็อบเจกต์เดิม ไม่ใช่สร้างอ็อบเจกต์ใหม่ทับ
+     ถ้าเขียน mixVals = {...} ใครที่ถือ reference ตัวเก่าไว้จะเห็นค่าเดิมค้างอยู่
+     (บัคชนิดเดียวกับ resetEverything() ที่เคยแก้ไปแล้วใน V5.6) */
+  Object.keys(MIX_DEF).forEach(k => { mixVals[k] = MIX_DEF[k]; });
+  Object.keys(mixMute).forEach(k => { mixMute[k] = false; });
+  A7.cache.clear();
+  applyMix(); a7setRoom(12);
+  _easyDone = false;
+  saveAll();
+  easyAudioBoot();
+  try{ renderMixer(); }catch(e){}
+  toast('คืนค่าเสียงกลับเป็นค่าแนะนำแล้ว');
+}
+
+/* =========================================================================
+   ยุบหน้ามิกเซอร์ให้เหลือสิ่งที่ต้องตัดสินใจจริง ๆ
+
+   ก่อนหน้านี้มี: ปุ่มเอนจิ้น 4 · ปุ่มฟัง 3 · เลือกชุดเสียง · เลือกเครื่อง 3 บัส ·
+   ติ๊กกลอง · ปุ่มโหลด · กล่องลากไฟล์ · แถบห้อง  = ตัวเลือก 15 อย่างในหน้าจอเดียว
+   ซึ่งมากเกินไปสำหรับสิ่งที่ผู้ใช้ต้องการจริง คือ "ทำให้เสียงดี"
+   ตอนนี้เหลือสองปุ่ม ที่เหลือพับไว้ข้างหลัง
+   ========================================================================= */
+function easyEngineLabel(){
+  const e = state.audioEngine;
+  if(e === 'user')   return {name:'เสียงที่คุณใส่เอง', ok:true};
+  if(e === 'sample'){
+    const n = ['bass','keys','drums'].filter(sfReady).length;
+    return {name: n ? `เครื่องดนตรีจริง (${n}/3)` : 'เครื่องดนตรีจริง — กำลังโหลด…', ok: n > 0};
+  }
+  return {name: e === 'v6' ? 'สังเคราะห์แบบเบา' : 'สังเคราะห์', ok:true};
+}
+function easyAudioPanel(){
+  const cur = easyEngineLabel();
+  const open = !!state.audioAdvanced;
+  return `<div class="lbox wide" style="grid-column:1 / -1">
+    <span>เสียงเครื่องดนตรี</span>
+    <p style="margin:4px 0 8px;font-size:12px">
+      กำลังใช้: <b style="color:${cur.ok ? '#8be7be' : '#ffd98b'}">${esc(cur.name)}</b></p>
+    <div class="row" style="gap:6px;flex-wrap:wrap">
+      <button class="btn${state.audioEngine === 'sample' || state.audioEngine === 'user' ? ' primary on' : ''}"
+              data-easy="real">🎷 เสียงเครื่องจริง</button>
+      <button class="btn${state.audioEngine === 'v7' || state.audioEngine === 'v6' ? ' primary on' : ''}"
+              data-easy="synth">〰 เสียงสังเคราะห์</button>
+      <button class="btn tiny" data-easy="reset">คืนค่าแนะนำ</button>
+    </div>
+    <p class="legend" style="margin-top:6px">
+      ${state.audioEngine === 'sample' || state.audioEngine === 'user'
+        ? 'โหลดจากเน็ตครั้งแรกครั้งเดียว หลังจากนั้นใช้ออฟไลน์ได้'
+        : 'ไม่ต้องต่อเน็ต เบาที่สุด'}</p>
+    <button class="btn tiny" data-easy="adv" style="margin-top:8px">
+      ${open ? '▾' : '▸'} ตั้งค่าละเอียด</button>
+  </div>`;
+}
+function easyWire(host){
+  $$('#mixGrid [data-easy]').forEach(b => b.onclick = () => {
+    const k = b.dataset.easy;
+    if(k === 'adv'){ state.audioAdvanced = !state.audioAdvanced; saveAll(); renderMixer(); return; }
+    if(k === 'reset'){ resetAudioDefaults(); return; }
+    if(k === 'synth'){ setAudioEngine('v7'); renderMixer(); return; }
+    /* เสียงเครื่องจริง — ถ้ามีไฟล์ของผู้ใช้อยู่แล้วให้ใช้ของนั้นก่อน */
+    setAudioEngine(['bass','keys','drums'].some(usHas) ? 'user' : 'sample');
+    renderMixer();
+  });
+  void host;
+}
+
+/* แทรกแผงง่ายไว้บนสุด แล้วซ่อนของละเอียดถ้ายังไม่กางกล่อง */
+const _renderMixerBeforeEasy = renderMixer;
+renderMixer = function(){
+  _renderMixerBeforeEasy();
+  const host = $('#mixGrid'); if(!host) return;
+  try{
+    const kids = host.children ? Array.from(host.children) : [];
+    const detail = kids[kids.length - 1];      /* กล่องละเอียดที่ _p36 เพิ่งต่อท้าย */
+    const panel = document.createElement('div');
+    panel.className = 'lbox wide';
+    panel.style.gridColumn = '1 / -1';
+    panel.innerHTML = easyAudioPanel();
+    if(detail && detail.parentNode){
+      detail.parentNode.insertBefore(panel, detail);
+      if(!state.audioAdvanced) detail.style.display = 'none';
+    } else host.appendChild(panel);
+    easyWire(host);
+  }catch(e){}
+};
+
+(function easyDefaults(){
+  try{
+    ['audioChosen','audioAdvanced'].forEach(f => {
+      if(PREF_FIELDS.indexOf(f) < 0) PREF_FIELDS.push(f);
+    });
+  }catch(e){}
+  if(typeof state.audioChosen !== 'boolean') state.audioChosen = false;
+  if(typeof state.audioAdvanced !== 'boolean') state.audioAdvanced = false;
+})();
 
 
 /* ══════ self-test ในตัวโปรแกรม: _p25_selftest.js ══════ */
@@ -15524,7 +16183,7 @@ function stRunAllV7(){
 
   /* ───────── เสียง ───────── */
   stGroup('V7 · เครื่องดนตรี');
-  stEq('มีสามเอนจิ้นให้เลือก (v7 · v6 · แซมเปิล)', Object.keys(AUDIO_ENGINES).length, 3);
+  stEq('มีสี่เอนจิ้นให้เลือก (v7 · v6 · แซมเปิล · ไฟล์ของผู้ใช้)', Object.keys(AUDIO_ENGINES).length, 4);
   (() => {
     const keep = state.audioEngine;
     let bad = 0;
@@ -15592,6 +16251,91 @@ function stRunAllV7(){
   ['sfFont','sfPick','sfDrums'].forEach(f =>
     stOk(`ฟิลด์ ${f} ถูกบันทึกลง storage`, PREF_FIELDS.indexOf(f) >= 0));
 
+  /* ───────── ไฟล์เสียงของผู้ใช้เอง ───────── */
+  stGroup('V7 · ไฟล์เสียงของผู้ใช้');
+  stOk('มีเอนจิ้น "เสียงที่ผมใส่เอง"', !!AUDIO_ENGINES.user);
+  /* อ่านชื่อไฟล์ → โน้ต · ครอบวิธีตั้งชื่อของคลังจริงหลายเจ้า */
+  [['A0v1.wav',21],['C4v8.wav',60],['A#0v1.wav',22],['C#4v16.wav',61],
+   ['bass_C2.wav',36],['Piano.F#3.mp3',54],['60.wav',60],['069.ogg',69],
+   ['Meatbass_pizz_E1.flac',28],['upright-Bb2.wav',46],['note_C-1.wav',0],
+   ['kick.wav',null],['Bass.wav',null]].forEach(([n,w]) =>
+    stEq(`ชื่อไฟล์ ${n}`, usNoteFromName(n), w));
+  /* อ่านชื่อไฟล์ → ชิ้นกลอง · ลำดับสำคัญ (openhat ต้องมาก่อน hat) */
+  [['kick_01.wav','kick'],['BassDrum.wav','kick'],['snare_center.wav','snare'],
+   ['HiHat_closed.wav','hat'],['openhat.wav','hatopen'],['hihat_open_2.wav','hatopen'],
+   ['ride_bell.wav','bell'],['ride_edge.wav','ride'],['brush_swirl.wav','brush'],
+   ['sidestick.wav','rim'],['floor_tom.wav','tom'],['random.wav',null]].forEach(([n,w]) =>
+    stEq(`ชิ้นกลองจาก ${n}`, usPieceFromName(n), w));
+  /* เดาบัสจากชื่อโฟลเดอร์ — โฟลเดอร์จริงมักไม่มีตัวคั่นหน้าคำ */
+  [[{name:'C2.wav', webkitRelativePath:'MyBass/pizz/C2.wav'}, 'bass'],
+   [{name:'A2.wav', webkitRelativePath:'UprightBass/A2.wav'}, 'bass'],
+   [{name:'C4.wav', webkitRelativePath:'Bassoon/C4.wav'}, 'keys'],
+   [{name:'kick.wav', webkitRelativePath:'JazzKit/kick.wav'}, 'drums'],
+   [{name:'C4v8.wav', webkitRelativePath:'Salamander/C4v8.wav'}, 'keys']].forEach(([f,w]) =>
+    stEq(`บัสของ ${f.webkitRelativePath}`, usFileKind(f), w));
+  [[21,'A0'],[60,'C4'],[36,'C2'],[0,'C-1']].forEach(([m,w]) =>
+    stEq(`MIDI ${m} → ชื่อโน้ต`, usMidiName(m), w));
+  /* เลื่อนอ็อกเทฟต้องอยู่ในช่วง −2..+2 */
+  (() => {
+    const keep = usShift('bass');
+    usSetShift('bass', 9);  stEq('เลื่อนอ็อกเทฟถูกจำกัดขอบบน', usShift('bass'), 2);
+    usSetShift('bass', -9); stEq('เลื่อนอ็อกเทฟถูกจำกัดขอบล่าง', usShift('bass'), -2);
+    usSetShift('bass', keep);
+  })();
+  /* ★ ข้อสำคัญที่สุดของทั้งระบบเสียง: ไม่ว่าตั้งค่าอะไร ต้องมีเสียงออกเสมอ */
+  (() => {
+    const keep = state.audioEngine;
+    let bad = 0;
+    ['user','sample','v7','v6'].forEach(e => {
+      state.audioEngine = e;
+      try{
+        ensureAudio();
+        playBass(40, 0, .3, .9); playKey(64, 0, .5, .5);
+        ['kick','snare','rim','brush','hat','hatopen','ride','bell','tom','clave']
+          .forEach(k => playDrum(k, 0, .7));
+      }catch(x){ bad++; }
+    });
+    state.audioEngine = keep;
+    stEq('ทั้งสี่เอนจิ้นเล่นได้ครบทุกเครื่อง ไม่มีทางเงียบ', bad, 0);
+  })();
+  stOk('ฟิลด์ usShift ถูกบันทึก', PREF_FIELDS.indexOf('usShift') >= 0);
+
+  /* ───────── เสียงดีตั้งแต่เปิด ───────── */
+  stGroup('V7 · ค่าเริ่มต้นของเสียง');
+  /* ★ กติกา: ค่าเริ่มต้นต้องเป็นตัวเลือกที่ดีที่สุดที่ทำได้ในสภาพนั้น
+     ไม่ใช่ตัวที่ปลอดภัยที่สุดสำหรับคนเขียนโปรแกรม */
+  stOk('มีตัวเลือกเสียงที่ดีที่สุดเสมอ', ['user','sample','v7'].indexOf(bestEngineNow()) >= 0, bestEngineNow());
+  (() => {
+    const keepC = state.audioChosen, keepE = state.audioEngine;
+    /* ผู้ใช้เลือกเอง → ระบบห้ามเปลี่ยนทับ */
+    setAudioEngine('v6');
+    stOk('กดเลือกเองแล้วระบบต้องจำ', audioChosen() === true);
+    easyAudioBoot();
+    stEq('ระบบต้องไม่เปลี่ยนทับสิ่งที่ผู้ใช้เลือก', state.audioEngine, 'v6');
+    state.audioChosen = keepC; state.audioEngine = keepE;
+  })();
+  ['v6','v7','sample','user'].forEach(e => {
+    const keep = state.audioEngine;
+    state.audioEngine = e;
+    stOk(`ป้ายสถานะของ ${e} ต้องมีข้อความ`, !!easyEngineLabel().name, easyEngineLabel().name);
+    state.audioEngine = keep;
+  });
+  (() => {
+    /* ปุ่มคืนค่าแนะนำต้องคืนได้จริงทุกช่อง */
+    const snap = {room: state.audioRoom, font: state.sfFont, bass: mixVals.bass, chosen: state.audioChosen};
+    state.audioRoom = 99; state.sfFont = 'MusyngKite'; mixVals.bass = 10; state.audioChosen = true;
+    resetAudioDefaults();
+    stEq('คืนค่า · ห้อง', a7room(), 12);
+    stEq('คืนค่า · ชุดเสียง', state.sfFont, 'FluidR3_GM');
+    /* ★ ต้องแก้ค่าในอ็อบเจกต์เดิม ไม่ใช่สร้างใหม่ทับ ไม่งั้นคนที่ถือ reference เก่าเห็นค่าค้าง */
+    stEq('คืนค่า · ระดับเบสในมิกซ์ (แก้ในที่ ไม่ใช่สร้างใหม่)', mixVals.bass, MIX_DEF.bass);
+    stEq('คืนค่า · กลับไปให้ระบบเลือกเอง', audioChosen(), false);
+    state.audioRoom = snap.room; state.sfFont = snap.font;
+    mixVals.bass = snap.bass; state.audioChosen = snap.chosen;
+  })();
+  ['audioChosen','audioAdvanced'].forEach(f =>
+    stOk(`ฟิลด์ ${f} ถูกบันทึก`, PREF_FIELDS.indexOf(f) >= 0));
+
   /* ───────── หน้าใหม่ ───────── */
   stGroup('V7 · หน้าใหม่');
   ['styles','concepts','spicy','library','articles'].forEach(w => {
@@ -15611,12 +16355,18 @@ function stSnapshotV7(){
   const s = _stSnapV6();
   s.v7 = {soloStyle: state.soloStyle, audioEngine: state.audioEngine, audioRoom: state.audioRoom,
           concept: state.concept, article: state.article, sfFont: state.sfFont,
-          sfPick: JSON.parse(JSON.stringify(state.sfPick || {})), sfDrums: state.sfDrums};
+          sfPick: JSON.parse(JSON.stringify(state.sfPick || {})), sfDrums: state.sfDrums,
+          usShift: JSON.parse(JSON.stringify(state.usShift || {})),
+          audioChosen: state.audioChosen, audioAdvanced: state.audioAdvanced,
+          mix: JSON.parse(JSON.stringify(mixVals))};
   return s;
 }
 function stRestoreV7(snap){
   _stRestV6(snap);
-  if(snap && snap.v7) Object.assign(state, snap.v7);
+  if(snap && snap.v7){
+    Object.assign(state, snap.v7);
+    if(snap.v7.mix) Object.keys(snap.v7.mix).forEach(k => { mixVals[k] = snap.v7.mix[k]; });
+  }
   try{ A7.cache.clear(); }catch(e){}
 }
 stSnapshot = stSnapshotV7;
